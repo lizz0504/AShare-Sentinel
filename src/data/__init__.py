@@ -7,6 +7,7 @@ from .data_loader import (
     fetch_sector_data,
     fetch_concept_data,
     get_hot_stocks_by_sector,
+    get_stock_sector,
     print_market_summary
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     'fetch_sector_data',
     'fetch_concept_data',
     'get_hot_stocks_by_sector',
+    'get_stock_sector',
     'print_market_summary'
 ]

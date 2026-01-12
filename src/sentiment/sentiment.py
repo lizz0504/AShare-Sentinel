@@ -352,7 +352,7 @@ if __name__ == "__main__":
     print("正在获取A股实时数据...")
     print("=" * 60)
 
-    df = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
+    df, _ = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
 
     if df.empty:
         print("错误: 未能获取到有效数据")

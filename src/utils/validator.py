@@ -118,7 +118,7 @@ class DataValidator:
 
     def validate_dataframe(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        验证并分割DataFrame为有效数据和无效数据
+        验证并分割DataFrame为有效数据和无效数据（优化版，使用向量化操作）
 
         Args:
             df: 要验证的DataFrame
@@ -129,24 +129,39 @@ class DataValidator:
         if df.empty:
             return df, pd.DataFrame()
 
-        valid_rows = []
-        invalid_rows = []
-        invalid_reasons = []
+        # 创建有效标志，初始为True
+        valid_mask = pd.Series([True] * len(df), index=df.index)
 
-        for idx, row in df.iterrows():
-            is_valid, errors = self.validate_row(row)
-            if is_valid:
-                valid_rows.append(idx)
-            else:
-                invalid_rows.append(idx)
-                invalid_reasons.append('; '.join(errors))
+        # 向量化验证价格
+        if 'price' in df.columns:
+            price_valid = (df['price'].notna()) & \
+                         (df['price'] >= self.config.MIN_PRICE) & \
+                         (df['price'] <= self.config.MAX_PRICE)
+            valid_mask &= price_valid
 
-        valid_df = df.loc[valid_rows].copy()
-        invalid_df = df.loc[invalid_rows].copy()
+        # 向量化验证涨跌幅
+        if 'change_pct' in df.columns:
+            change_valid = (df['change_pct'].notna()) & \
+                          (df['change_pct'] >= self.config.MIN_CHANGE_PCT) & \
+                          (df['change_pct'] <= self.config.MAX_CHANGE_PCT)
+            valid_mask &= change_valid
 
-        # 添加错误信息列
-        if not invalid_df.empty:
-            invalid_df['validation_errors'] = invalid_reasons
+        # 向量化验证换手率（如果存在）
+        if 'turnover' in df.columns:
+            turnover_valid = (df['turnover'].isna()) | \
+                            ((df['turnover'] >= self.config.MIN_TURNOVER) & \
+                             (df['turnover'] <= self.config.MAX_TURNOVER))
+            valid_mask &= turnover_valid
+
+        # 向量化验证成交量
+        if 'volume' in df.columns:
+            volume_valid = (df['volume'].notna()) & \
+                          (df['volume'] >= self.config.MIN_VOLUME)
+            valid_mask &= volume_valid
+
+        # 分割数据
+        valid_df = df[valid_mask].copy()
+        invalid_df = df[~valid_mask].copy()
 
         # 记录验证结果
         total = len(df)

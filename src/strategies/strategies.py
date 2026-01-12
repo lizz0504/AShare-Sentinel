@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import pandas as pd
+import numpy as np
 from typing import Optional
 from src.utils.logger import get_logger
 
@@ -44,6 +45,9 @@ class StrategyScanner:
     TURTLE_MAX_CHANGE = 5.0
     TURTLE_MIN_TURNOVER = 6.0
 
+    # 统一输出列（AI 分析需要）
+    OUTPUT_COLUMNS = ['symbol', 'name', 'price', 'change_pct', 'turnover', 'volume_ratio']
+
     def __init__(self, df: pd.DataFrame):
         """
         初始化策略扫描器
@@ -52,6 +56,14 @@ class StrategyScanner:
             df: 包含股票数据的DataFrame
         """
         self.df = df.copy() if df is not None else pd.DataFrame()
+
+        # 确保 volume_ratio 列存在
+        if not self.df.empty and 'volume_ratio' not in self.df.columns:
+            self.df['volume_ratio'] = 1.0
+
+        # 填充 volume_ratio 空值为 1.0，并确保为 float 类型
+        if not self.df.empty:
+            self.df['volume_ratio'] = self.df['volume_ratio'].fillna(1.0).astype(float)
 
         if self.df.empty:
             logger.warning("输入的DataFrame为空，策略扫描将返回空结果")
@@ -65,7 +77,7 @@ class StrategyScanner:
         Returns:
             bool: 是否包含必要列
         """
-        required_columns = ['symbol', 'name', 'price', 'change_pct', 'turnover', 'circ_mv']
+        required_columns = ['symbol', 'name', 'price', 'change_pct', 'turnover', 'volume_ratio']
 
         if self.df.empty:
             return False
@@ -80,7 +92,7 @@ class StrategyScanner:
 
     def _standardize_output(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        标准化输出：只保留指定列，按涨幅降序排列
+        标准化输出：只保留指定列，确保数据类型正确
 
         Args:
             df: 待处理的DataFrame
@@ -89,14 +101,21 @@ class StrategyScanner:
             标准化后的DataFrame
         """
         if df.empty:
-            return pd.DataFrame(columns=['symbol', 'name', 'price', 'change_pct', 'turnover', 'circ_mv'])
+            return pd.DataFrame(columns=self.OUTPUT_COLUMNS)
 
-        # 只保留指定列
-        columns = ['symbol', 'name', 'price', 'change_pct', 'turnover', 'circ_mv']
-        result = df[columns].copy()
+        # 确保所有输出列都存在
+        for col in self.OUTPUT_COLUMNS:
+            if col not in df.columns:
+                if col == 'volume_ratio':
+                    df[col] = 1.0
+                else:
+                    df[col] = None
 
-        # 按涨幅降序排列
-        result = result.sort_values('change_pct', ascending=False).reset_index(drop=True)
+        # 只保留指定列，按固定顺序
+        result = df[self.OUTPUT_COLUMNS].copy()
+
+        # 确保 volume_ratio 为 float 类型
+        result['volume_ratio'] = result['volume_ratio'].fillna(1.0).astype(float)
 
         return result
 
@@ -118,13 +137,13 @@ class StrategyScanner:
             limit: 返回前N条结果，默认10
 
         Returns:
-            符合条件的股票DataFrame (只含5列: symbol, name, change_pct, turnover, price)
+            符合条件的股票DataFrame (统一输出格式)
         """
         logger.info("=" * 50)
         logger.info("执行策略A: 强势中军/主升浪")
 
         if not self._validate_columns():
-            return pd.DataFrame(columns=['symbol', 'name', 'change_pct', 'turnover', 'price'])
+            return pd.DataFrame(columns=self.OUTPUT_COLUMNS)
 
         try:
             # 市值阈值
@@ -145,9 +164,8 @@ class StrategyScanner:
 
             result = self.df[mask].copy()
 
-            # 只保留5列（精简输出）
-            columns = ['symbol', 'name', 'change_pct', 'turnover', 'price']
-            result = result[columns].copy()
+            # 标准化输出
+            result = self._standardize_output(result)
 
             # 严格按换手率降序排列
             result = result.sort_values('turnover', ascending=False).reset_index(drop=True)
@@ -169,7 +187,7 @@ class StrategyScanner:
 
         except Exception as e:
             logger.error(f"策略A执行出错: {e}")
-            return pd.DataFrame(columns=['symbol', 'name', 'change_pct', 'turnover', 'price'])
+            return pd.DataFrame(columns=self.OUTPUT_COLUMNS)
 
     def scan_limit_candidates(self, limit: int = 10) -> pd.DataFrame:
         """
@@ -187,13 +205,13 @@ class StrategyScanner:
             limit: 返回前N条结果，默认10
 
         Returns:
-            符合条件的股票DataFrame (只含5列: symbol, name, change_pct, turnover, price)
+            符合条件的股票DataFrame (统一输出格式)
         """
         logger.info("=" * 50)
         logger.info("执行策略B: 冲击涨停/20cm博弈")
 
         if not self._validate_columns():
-            return pd.DataFrame(columns=['symbol', 'name', 'change_pct', 'turnover', 'price'])
+            return pd.DataFrame(columns=self.OUTPUT_COLUMNS)
 
         try:
             # 构建筛选条件
@@ -205,9 +223,8 @@ class StrategyScanner:
 
             result = self.df[mask].copy()
 
-            # 只保留5列（精简输出）
-            columns = ['symbol', 'name', 'change_pct', 'turnover', 'price']
-            result = result[columns].copy()
+            # 标准化输出
+            result = self._standardize_output(result)
 
             # 严格按涨幅降序排列
             result = result.sort_values('change_pct', ascending=False).reset_index(drop=True)
@@ -227,7 +244,7 @@ class StrategyScanner:
 
         except Exception as e:
             logger.error(f"策略B执行出错: {e}")
-            return pd.DataFrame(columns=['symbol', 'name', 'change_pct', 'turnover', 'price'])
+            return pd.DataFrame(columns=self.OUTPUT_COLUMNS)
 
     def scan_turtle_stocks(self, limit: int = 10) -> pd.DataFrame:
         """
@@ -245,13 +262,13 @@ class StrategyScanner:
             limit: 返回前N条结果，默认10
 
         Returns:
-            符合条件的股票DataFrame (只含5列: symbol, name, change_pct, turnover, price)
+            符合条件的股票DataFrame (统一输出格式)
         """
         logger.info("=" * 50)
         logger.info("执行策略C: 温和放量/趋势股")
 
         if not self._validate_columns():
-            return pd.DataFrame(columns=['symbol', 'name', 'change_pct', 'turnover', 'price'])
+            return pd.DataFrame(columns=self.OUTPUT_COLUMNS)
 
         try:
             # 构建筛选条件
@@ -263,9 +280,8 @@ class StrategyScanner:
 
             result = self.df[mask].copy()
 
-            # 只保留5列（精简输出）
-            columns = ['symbol', 'name', 'change_pct', 'turnover', 'price']
-            result = result[columns].copy()
+            # 标准化输出
+            result = self._standardize_output(result)
 
             # 严格按换手率降序排列
             result = result.sort_values('turnover', ascending=False).reset_index(drop=True)
@@ -285,14 +301,14 @@ class StrategyScanner:
 
         except Exception as e:
             logger.error(f"策略C执行出错: {e}")
-            return pd.DataFrame(columns=['symbol', 'name', 'change_pct', 'turnover', 'price'])
+            return pd.DataFrame(columns=self.OUTPUT_COLUMNS)
 
     def format_output(self, df: pd.DataFrame, top_n: Optional[int] = None) -> str:
         """
-        格式化输出策略结果（精简版，5列）
+        格式化输出策略结果（统一6列格式）
 
         Args:
-            df: 策略筛选结果（只含5列: symbol, name, change_pct, turnover, price）
+            df: 策略筛选结果
             top_n: 只显示前N只，None表示全部显示
 
         Returns:
@@ -307,18 +323,19 @@ class StrategyScanner:
         else:
             display_df = df.copy()
 
-        # 构建输出字符串（5列精简格式）
+        # 构建输出字符串（6列格式）
         lines = []
-        lines.append(f"{'代码':<10}{'名称':<12}{'涨幅%':<10}{'换手%':<10}{'价格':<10}")
-        lines.append("-" * 52)
+        lines.append(f"{'代码':<10}{'名称':<12}{'价格':<10}{'涨幅%':<10}{'换手%':<10}{'量比':<10}")
+        lines.append("-" * 62)
 
         for _, row in display_df.iterrows():
             lines.append(
                 f"{row['symbol']:<10}"
                 f"{row['name']:<12}"
+                f"{row['price']:<10.2f}"
                 f"{row['change_pct']:<10.2f}"
                 f"{row['turnover']:<10.2f}"
-                f"{row['price']:<10.2f}"
+                f"{row['volume_ratio']:<10.2f}"
             )
 
         return "\n".join(lines)
@@ -352,7 +369,7 @@ if __name__ == "__main__":
     print("=" * 70)
     print("\n正在获取A股实时数据...")
 
-    df = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
+    df, _ = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
 
     if df.empty:
         print("错误: 未能获取到有效数据")
@@ -363,8 +380,8 @@ if __name__ == "__main__":
 
         # 策略A: 放量突破
         print(format_strategy_header(
-            "策略A: 放量突破/首板挖掘",
-            "寻找正在拉升且人气聚集的股票 (涨幅3-8%, 换手3-15%, 市值10-200亿)"
+            "策略A: 强势中军",
+            "寻找正在拉升且人气聚集的股票 (涨幅5-8%, 换手7-15%, 市值10-200亿)"
         ))
         result_a = scanner.scan_volume_breakout()
         print(scanner.format_output(result_a, top_n=10))
@@ -372,8 +389,8 @@ if __name__ == "__main__":
 
         # 策略B: 准涨停
         print(format_strategy_header(
-            "策略B: 准涨停/打板",
-            "寻找即将封板的股票 (涨幅8-9.8%, 换手>5%)"
+            "策略B: 冲击涨停",
+            "寻找即将封板的股票 (涨幅8-20%, 换手>8%)"
         ))
         result_b = scanner.scan_limit_candidates()
         print(scanner.format_output(result_b, top_n=10))
@@ -382,7 +399,7 @@ if __name__ == "__main__":
         # 策略C: 低位潜伏
         print(format_strategy_header(
             "策略C: 低位潜伏",
-            "寻找涨幅小但换手高的吸筹股 (涨幅0-2%, 换手>5%)"
+            "寻找涨幅小但换手高的吸筹股 (涨幅2-5%, 换手>6%)"
         ))
         result_c = scanner.scan_turtle_stocks()
         print(scanner.format_output(result_c, top_n=10))
@@ -393,8 +410,8 @@ if __name__ == "__main__":
         print("策略扫描汇总")
         print("=" * 70)
         print(f"  总股票数: {len(df)}")
-        print(f"  策略A (放量突破): {len(result_a)} 只")
-        print(f"  策略B (准涨停): {len(result_b)} 只")
+        print(f"  策略A (强势中军): {len(result_a)} 只")
+        print(f"  策略B (冲击涨停): {len(result_b)} 只")
         print(f"  策略C (低位潜伏): {len(result_c)} 只")
         print(f"  合计机会: {len(result_a) + len(result_b) + len(result_c)} 只")
         print("=" * 70)

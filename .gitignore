@@ -44,3 +44,7 @@ Thumbs.db
 
 # Streamlit
 .streamlit/
+
+# Environment
+.env
+.env.local

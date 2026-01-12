@@ -10,6 +10,7 @@ AShare-Sentinel - A股热度分析工具
 import akshare as ak
 import pandas as pd
 import time
+from pathlib import Path
 from typing import Optional, Tuple
 import warnings
 
@@ -57,9 +58,10 @@ def fetch_realtime_data(
     filter_st: bool = True,
     use_cache: bool = True,
     validate: bool = True
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, str]:
     """
     获取A股实时行情数据（增强版）
+    非交易时间自动使用当日收盘价数据
 
     Args:
         filter_st: 是否过滤ST股票，默认为True
@@ -67,10 +69,11 @@ def fetch_realtime_data(
         validate: 是否验证数据，默认为True
 
     Returns:
-        pd.DataFrame: 清洗后的实时行情数据，包含以下字段:
+        Tuple[pd.DataFrame, str]: (清洗后的实时行情数据, 更新时间字符串)
+        DataFrame包含以下字段:
             - symbol: 股票代码
             - name: 股票名称
-            - price: 最新价
+            - price: 最新价/收盘价
             - change_pct: 涨跌幅(%)
             - volume: 成交量(手)
             - amount: 成交额(元)
@@ -81,16 +84,48 @@ def fetch_realtime_data(
             - low: 最低价
             - open: 今开价
             - close: 昨收价
+        更新时间字符串格式: "YYYY-MM-DD HH:MM:SS"
     """
+    from datetime import datetime
+    now = datetime.now()
+    current_hour = now.hour
+    current_weekday = now.weekday()
+
+    # 判断是否为交易时间（工作日9:00-15:00）
+    is_trading_time = (current_weekday < 5) and (9 <= current_hour < 15)
+
     cache_key = "realtime_data"
 
     # 尝试从缓存获取
     if use_cache:
         cache_mgr = DataFrameCache()
+
+        # 非交易时间使用更长缓存（24小时）
+        if not is_trading_time:
+            # 检查是否有任何缓存（无论是否过期）
+            cache_path = Path(__file__).parent.parent / 'cache' / f"{cache_key}.pkl"
+            if cache_path.exists():
+                import pickle
+                import time
+                try:
+                    with open(cache_path, 'rb') as f:
+                        cache_data = pickle.load(f)
+                    # 非交易时间，缓存24小时有效
+                    if time.time() - cache_data['timestamp'] < 86400:  # 24小时
+                        logger.info(f"非交易时间，使用缓存数据: {len(cache_data['data'])} 只股票")
+                        from datetime import datetime
+                        update_time = datetime.fromtimestamp(cache_data['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+                        return cache_data['data'], update_time
+                except Exception:
+                    pass
+
         cached_data = cache_mgr.get(cache_key)
-        if cached_data is not None:
+        if cached_data is not None and not cached_data.empty:
             logger.info(f"从缓存获取实时数据: {len(cached_data)} 只股票")
-            return cached_data
+            update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            return cached_data, update_time
+        elif cached_data is not None and cached_data.empty:
+            logger.warning("缓存数据为空，将重新获取")
 
     logger.info("正在获取A股实时行情数据...")
 
@@ -102,7 +137,7 @@ def fetch_realtime_data(
 
     if df is None or df.empty:
         logger.error("获取实时行情数据失败")
-        return pd.DataFrame()
+        return pd.DataFrame(), ""
 
     logger.info(f"成功获取 {len(df)} 只股票的原始数据")
 
@@ -121,6 +156,7 @@ def fetch_realtime_data(
         '今开': 'open',
         '昨收': 'close',
         '换手率': 'turnover',
+        '量比': 'volume_ratio',
         '市盈率-动态': 'pe_ttm',
         '市净率': 'pb',
         '总市值': 'total_mv',
@@ -131,10 +167,25 @@ def fetch_realtime_data(
     df = df.rename(columns=column_mapping)
 
     # 数据清洗
-    # 1. 剔除成交量为0的股票（停牌或无交易）
-    before_count = len(df)
-    df = df[df['volume'] > 0]
-    logger.info(f"剔除停牌股票: {before_count - len(df)} 只")
+    # 1. 判断是否为交易时间，如果不是则保留成交量为0的股票（使用收盘价）
+    from datetime import datetime
+    now = datetime.now()
+    current_hour = now.hour
+    current_weekday = now.weekday()
+
+    # 周末全天非交易，工作日9:00-15:00为交易时间
+    is_trading_time = (current_weekday < 5) and (9 <= current_hour < 15)
+
+    if is_trading_time:
+        # 交易时间：剔除成交量为0的股票（停牌或无交易）
+        before_count = len(df)
+        df = df[df['volume'] > 0]
+        logger.info(f"剔除停牌股票: {before_count - len(df)} 只")
+    else:
+        # 非交易时间：保留成交量为0但有价格的股票（使用收盘价）
+        before_count = len(df)
+        df = df[df['price'] > 0]  # 只要有价格就保留
+        logger.info(f"非交易时间，使用收盘价数据。保留有价格股票: {len(df)} 只（原{before_count}只）")
 
     # 2. 可选：过滤ST股票
     if filter_st:
@@ -145,13 +196,13 @@ def fetch_realtime_data(
 
     # 3. 确保关键字段不为空
     before_count = len(df)
-    df = df.dropna(subset=['price', 'change_pct', 'volume'])
+    df = df.dropna(subset=['price', 'change_pct'])
     logger.info(f"剔除关键字段为空的股票: {before_count - len(df)} 只")
 
     # 4. 数据类型转换
     numeric_columns = ['price', 'change_pct', 'volume', 'amount',
-                      'turnover', 'circ_mv', 'total_mv', 'high', 'low',
-                      'open', 'close', 'amplitude', 'pe_ttm', 'pb']
+                      'turnover', 'volume_ratio', 'circ_mv', 'total_mv',
+                      'high', 'low', 'open', 'close', 'amplitude', 'pe_ttm', 'pb']
 
     for col in numeric_columns:
         if col in df.columns:
@@ -171,7 +222,9 @@ def fetch_realtime_data(
     if use_cache:
         cache_mgr.set(cache_key, df)
 
-    return df
+    # 返回数据和时间戳
+    update_time = now.strftime('%Y-%m-%d %H:%M:%S')
+    return df, update_time
 
 
 def fetch_sector_data(top_n: int = 10, use_cache: bool = True) -> pd.DataFrame:
@@ -428,6 +481,40 @@ def clear_cache() -> None:
     logger.info("所有缓存已清空")
 
 
+def get_stock_sector(symbol: str) -> str:
+    """
+    获取单只股票的所属板块/行业
+
+    Args:
+        symbol: 股票代码（如 "300059" 或 "000001"）
+
+    Returns:
+        str: 板块/行业名称，失败返回 "未知"
+    """
+    try:
+        # 使用 AkShare 获取个股信息
+        info_df = ak.stock_individual_info_em(symbol=symbol)
+
+        if info_df is None or info_df.empty:
+            logger.warning(f"获取股票 {symbol} 信息失败: 无数据")
+            return "未知"
+
+        # 转换为字典方便查找
+        info_dict = dict(zip(info_df['item'], info_df['value']))
+
+        # 尝试获取行业字段
+        sector = info_dict.get('行业') or info_dict.get('板块') or info_dict.get('所属行业') or info_dict.get('所属板块')
+
+        if sector and sector != '-':
+            return str(sector).strip()
+
+        return "未知"
+
+    except Exception as e:
+        logger.warning(f"获取股票 {symbol} 板块信息失败: {e}")
+        return "未知"
+
+
 if __name__ == "__main__":
     # 测试代码
     print("="*60)
@@ -435,9 +522,10 @@ if __name__ == "__main__":
     print("="*60)
 
     # 1. 获取实时行情数据
-    realtime_data = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
+    realtime_data, update_time = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
 
     if not realtime_data.empty:
+        print(f"\n更新时间: {update_time}")
         print("\n实时行情数据预览 (前5行):")
         print("-"*60)
         display_columns = ['symbol', 'name', 'price', 'change_pct', 'volume',
