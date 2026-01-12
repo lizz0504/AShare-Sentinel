@@ -295,7 +295,18 @@ st.markdown("""
 def load_market_data():
     """加载市场数据"""
     try:
-        df, update_time = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
+        result = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
+
+        # 处理返回值，确保是元组格式
+        if isinstance(result, tuple):
+            if len(result) == 2:
+                df, update_time = result
+            else:
+                st.error(f"返回值格式错误: 期望2个值，实际{len(result)}个")
+                return None, None, None, None, None, ""
+        else:
+            st.error(f"返回值类型错误: {type(result)}")
+            return None, None, None, None, None, ""
 
         # 调试信息
         if df is None:

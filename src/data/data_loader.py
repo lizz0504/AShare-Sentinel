@@ -126,6 +126,9 @@ def fetch_realtime_data(
             return cached_data, update_time
         elif cached_data is not None and cached_data.empty:
             logger.warning("缓存数据为空，将重新获取")
+        # 如果cached_data是其他类型（如旧格式的元组），跳过缓存
+        elif cached_data is not None:
+            logger.warning(f"缓存数据格式异常: {type(cached_data)}，将重新获取")
 
     logger.info("正在获取A股实时行情数据...")
 
