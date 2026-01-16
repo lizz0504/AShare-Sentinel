@@ -48,3 +48,16 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Portfolio
+portfolio.json
+
+# Temporary files
+tmp*
+tmpclaude*
+nul

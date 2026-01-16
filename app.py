@@ -2,6 +2,9 @@
 """
 A股短线雷达 - 专业量化交易终端
 设计原则：专业、易懂、实用
+
+数据库支持：SQLite / PostgreSQL（通过 DATABASE_TYPE 环境变量切换）
+性能优化：使用 Streamlit 缓存减少数据库查询
 """
 
 import sys
@@ -15,7 +18,9 @@ from datetime import datetime
 from src.data.data_loader import fetch_realtime_data, clear_cache
 from src.sentiment.sentiment import MarketAnalyzer
 from src.strategies.strategies import StrategyScanner
-from src.database import init_db, get_records, get_records_by_status, update_status, get_statistics
+from src.database import init_db, update_status
+from src.database.db_manager import get_db_manager, DatabaseConfig
+from auto_analysis import AutoAnalysisEngine
 
 # =============================================================================
 # 页面配置
@@ -292,9 +297,293 @@ st.markdown("""
 # =============================================================================
 # 数据加载函数
 # =============================================================================
+
+@st.cache_data(ttl=300)  # 5分钟缓存
+def _fetch_market_data_cached():
+    """
+    内部缓存函数 - 加载市场原始数据
+    仅在成功时返回数据，失败时抛出异常以阻止缓存
+
+    Returns:
+        Tuple[pd.DataFrame, str]: (股票数据, 更新时间)
+
+    Raises:
+        ValueError: 数据为空时抛出，防止缓存空结果
+    """
+    result = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
+
+    # 处理返回值，确保是元组格式
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise ValueError(f"返回值格式错误: 期望元组(2)，实际{type(result)}")
+
+    df, update_time = result
+
+    if df is None:
+        raise ValueError("返回的 df 为 None")
+
+    if df.empty:
+        raise ValueError("获取的市场数据为空")
+
+    return df, update_time
+
+
 def load_market_data():
+    """加载市场数据（带缓存和错误处理）"""
+    try:
+        # 尝试从缓存获取数据
+        df, update_time = _fetch_market_data_cached()
+
+        # 数据加载成功
+        st.success(f"[OK] 成功加载 {len(df)} 只股票数据")
+
+        analyzer = MarketAnalyzer(df)
+        sentiment = analyzer.generate_daily_report()
+
+        scanner = StrategyScanner(df)
+        result_a = scanner.scan_volume_breakout(limit=10)
+        result_b = scanner.scan_limit_candidates(limit=10)
+        result_c = scanner.scan_turtle_stocks(limit=10)
+
+        return df, sentiment, result_a, result_b, result_c, update_time
+
+    except ValueError as e:
+        st.warning(f"[WAIT] 市场数据同步中，请稍候...")
+        st.info(f"提示: {str(e)}")
+
+        # 提供重试按钮
+        if st.button("[REFRESH] 立即刷新", key="refresh_market_data"):
+            # 清除缓存
+            _fetch_market_data_cached.clear()
+            from src.data.data_loader import clear_cache
+            clear_cache()
+            st.rerun()
+
+        return None, None, None, None, None, ""
+
+    except Exception as e:
+        st.error(f"[ERROR] 加载数据时出错: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+
+        # 提供重试选项
+        if st.button("[REFRESH] 清除缓存并重试", key="retry_market_data"):
+            _fetch_market_data_cached.clear()
+            from src.data.data_loader import clear_cache
+            clear_cache()
+            st.rerun()
+
+        return None, None, None, None, None, ""
+
+
+# =============================================================================
+# 数据库读取函数（使用缓存和统一数据库管理器）
+# =============================================================================
+
+@st.cache_data(ttl=10)  # 10秒缓存，更快刷新
+def _fetch_records_from_db(status: str, date: str, limit: int):
+    """
+    内部缓存函数 - 从数据库读取分析记录
+    仅在成功时返回数据，失败时抛出异常以阻止缓存
+
+    Args:
+        status: 状态筛选
+        date: 日期
+        limit: 记录数限制
+
+    Returns:
+        List[Dict]: 分析记录列表
+
+    Raises:
+        ValueError: 数据为空时抛出，防止缓存空结果
+    """
+    db = get_db_manager()
+
+    # 根据数据库类型构建查询
+    if db.database_type == "postgresql":
+        if status:
+            query = f"""
+                SELECT * FROM stock_analysis
+                WHERE status = '{status}'
+                AND DATE(created_at) = '{date}'
+                ORDER BY ai_score DESC, created_at DESC
+                LIMIT {limit}
+            """
+        else:
+            query = f"""
+                SELECT * FROM stock_analysis
+                WHERE DATE(created_at) = '{date}'
+                ORDER BY ai_score DESC, created_at DESC
+                LIMIT {limit}
+            """
+    else:
+        # SQLite 语法
+        if status:
+            query = f"""
+                SELECT * FROM stock_analysis
+                WHERE status = '{status}'
+                AND DATE(created_at) = '{date}'
+                ORDER BY ai_score DESC, created_at DESC
+                LIMIT {limit}
+            """
+        else:
+            query = f"""
+                SELECT * FROM stock_analysis
+                WHERE DATE(created_at) = '{date}'
+                ORDER BY ai_score DESC, created_at DESC
+                LIMIT {limit}
+            """
+
+    # 读取数据
+    df = db.fetch_df(query)
+
+    # 关键修改：如果数据为空，抛出异常阻止缓存
+    if df.empty:
+        raise ValueError(f"数据库暂无数据 (status={status}, date={date})")
+
+    return df.to_dict('records')
+
+
+def get_records_by_status_cached(status: str = None, date: str = None, limit: int = 100):
+    """
+    从数据库读取分析记录（带缓存和错误处理）
+
+    Args:
+        status: 状态筛选 (New/Watchlist/Ignored/None表示全部)
+        date: 日期筛选 (格式: YYYY-MM-DD，None表示今天)
+        limit: 最多返回的记录数
+
+    Returns:
+        List[Dict]: 分析记录列表
+    """
+    # 默认查询今天
+    if date is None:
+        date = datetime.now().strftime('%Y-%m-%d')
+
+    try:
+        return _fetch_records_from_db(status, date, limit)
+    except ValueError as e:
+        st.warning(f"[WAIT] 数据同步中，请点击刷新按钮重试")
+        if st.button("[REFRESH] 立即刷新", key=f"refresh_{status}_{date}_{limit}"):
+            _fetch_records_from_db.clear()  # 清除特定缓存
+            st.rerun()
+        return []  # 返回空列表，但不缓存
+    except Exception as e:
+        st.error(f"[ERROR] 读取失败: {e}")
+        return []
+
+
+@st.cache_data(ttl=10)  # 10秒缓存，更快刷新
+def _fetch_statistics_from_db(days: int):
+    """
+    内部缓存函数 - 获取数据库统计信息
+    仅在成功时返回数据，失败时抛出异常以阻止缓存
+
+    Args:
+        days: 统计最近N天
+
+    Returns:
+        Dict: 统计信息
+
+    Raises:
+        ValueError: 数据为空时抛出，防止缓存空结果
+    """
+    db = get_db_manager()
+
+    # 根据数据库类型构建查询
+    if db.database_type == "postgresql":
+        query = f"""
+            SELECT
+                COUNT(*) as total_count,
+                COUNT(DISTINCT symbol) as unique_symbols,
+                AVG(ai_score) as avg_score
+            FROM stock_analysis
+            WHERE DATE(created_at) >= CURRENT_DATE - INTERVAL '{days}' days
+            AND ai_score IS NOT NULL
+        """
+    else:
+        # SQLite 语法
+        query = f"""
+            SELECT
+                COUNT(*) as total_count,
+                COUNT(DISTINCT symbol) as unique_symbols,
+                AVG(ai_score) as avg_score
+            FROM stock_analysis
+            WHERE DATE(created_at) >= DATE('now', '-' || '{days}' || ' days')
+            AND ai_score IS NOT NULL
+        """
+
+    df = db.fetch_df(query)
+
+    # 关键修改：如果数据为空，抛出异常阻止缓存
+    if df.empty:
+        raise ValueError(f"统计数据暂不可用 (days={days})")
+
+    return {
+        'total_count': int(df['total_count'].iloc[0]),
+        'unique_symbols': int(df['unique_symbols'].iloc[0]),
+        'avg_score': round(float(df['avg_score'].iloc[0]), 2) if pd.notna(df['avg_score'].iloc[0]) else 0,
+        'days': days
+    }
+
+
+def get_statistics_cached(days: int = 7):
+    """
+    获取数据库统计信息（带缓存和错误处理）
+
+    Args:
+        days: 统计最近N天
+
+    Returns:
+        Dict: 统计信息
+    """
+    try:
+        return _fetch_statistics_from_db(days)
+    except ValueError:
+        st.warning("[WAIT] 统计数据同步中...")
+        return {
+            'total_count': 0,
+            'unique_symbols': 0,
+            'avg_score': 0,
+            'days': days
+        }
+    except Exception as e:
+        st.error(f"[ERROR] 获取统计信息失败: {e}")
+        return {
+            'total_count': 0,
+            'unique_symbols': 0,
+            'avg_score': 0,
+            'days': days
+        }
+
+
+def update_record_status_cached(record_id: int, new_status: str):
+    """
+    更新记录状态（会清除缓存）
+
+    Args:
+        record_id: 记录ID
+        new_status: 新状态
+    """
+    try:
+        # 清除缓存以获取最新数据
+        _fetch_records_from_db.clear()
+        _fetch_statistics_from_db.clear()
+
+        # 更新数据库
+        update_status(record_id, new_status)
+        st.success(f"状态已更新为: {new_status}")
+        st.rerun()
+
+    except Exception as e:
+        st.error(f"更新状态失败: {e}")
+
+
+# =============================================================================
+# 渲染组件
+# =============================================================================
     """加载市场数据"""
     try:
+        # 使用内部缓存（5分钟有效期）
         result = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)
 
         # 处理返回值，确保是元组格式
@@ -314,10 +603,24 @@ def load_market_data():
             return None, None, None, None, None, ""
 
         if df.empty:
-            st.error(f"调试：df.empty=True, len={len(df)}")
-            return None, None, None, None, None, ""
+            st.error("调试：df.empty=True，正在重新获取...")
+            # 清除缓存并重新获取
+            from src.data.data_loader import clear_cache
+            clear_cache()
+            result = fetch_realtime_data(filter_st=True, use_cache=False, validate=True)
 
-        st.info(f"调试：成功加载 {len(df)} 只股票")
+            if isinstance(result, tuple) and len(result) == 2:
+                df, update_time = result
+            else:
+                st.error("重新获取数据失败")
+                return None, None, None, None, None, ""
+
+            if df.empty:
+                st.error("重新获取后数据仍为空")
+                return None, None, None, None, None, ""
+
+        # 数据加载成功
+        st.success(f"成功加载 {len(df)} 只股票数据")
 
         analyzer = MarketAnalyzer(df)
         sentiment = analyzer.generate_daily_report()
@@ -584,26 +887,65 @@ def render_tab_signals():
             label_visibility="collapsed"
         )
     with col3:
+        if st.button("清除缓存", use_container_width=True):
+            st.cache_data.clear()
+            st.success("缓存已清除，正在刷新...")
+            st.rerun()
         if st.button("刷新", use_container_width=True):
             st.rerun()
     with col4:
         if st.button("运行AI分析", use_container_width=True, type="primary"):
-            st.info("请在终端运行：python auto_analysis.py")
+            # 显示进度
+            try:
+                engine = AutoAnalysisEngine()
+
+                # 创建进度条和状态容器
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                # 定义进度回调函数
+                def update_progress(progress, message):
+                    progress_bar.progress(progress)
+                    status_text.info(message)
+
+                # 运行分析（限制数量以便快速响应）
+                engine.run_analysis(
+                    max_candidates=10,  # 先分析10只股票测试
+                    use_cache=True,
+                    score_threshold=75,
+                    progress_callback=update_progress
+                )
+
+                progress_bar.progress(100)
+                status_text.success("AI 分析完成！")
+
+                # 清除缓存并刷新
+                clear_cache()
+
+                # 等待1秒后刷新页面
+                import time
+                time.sleep(1)
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"分析失败: {str(e)}")
+                import traceback
+                st.error(traceback.format_exc())
 
     date_str = selected_date.strftime('%Y-%m-%d')
 
     status_map = {"全部": None, "待处理": "New", "自选": "Watchlist", "已归档": "Ignored"}
-    records = get_records_by_status(status=status_map[status_filter], date=date_str, limit=100)
+    records = get_records_by_status_cached(status=status_map[status_filter], date=date_str, limit=100)
 
     # 统计
-    stats = get_statistics(days=7)
+    stats = get_statistics_cached(days=7)
     col_s1, col_s2, col_s3 = st.columns(3)
     with col_s1:
         render_metric_card("本周分析", f"{stats['total_count']}", "条")
     with col_s2:
         render_metric_card("平均评分", f"{stats['avg_score']:.1f}", "分")
     with col_s3:
-        watchlist_count = len(get_records_by_status('Watchlist', date_str))
+        watchlist_count = len(get_records_by_status_cached('Watchlist', date_str))
         render_metric_card("自选股票", f"{watchlist_count}", "只")
 
     st.markdown("---")
@@ -625,43 +967,74 @@ def render_tab_signals():
 
 
 def render_tab_portfolio():
-    """自选管理"""
+    """模拟操盘"""
     st.markdown('<div class="app-title">模拟操盘</div>', unsafe_allow_html=True)
-    st.markdown('<div class="app-subtitle">跟踪自选，回顾历史</div>', unsafe_allow_html=True)
+    st.markdown('<div class="app-subtitle">跟踪持仓，回顾历史</div>', unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("**自选列表**")
-        watchlist = get_records_by_status('Watchlist', limit=20)
+        st.markdown("**持仓列表**")
 
-        if watchlist:
-            for record in watchlist:
-                score = record.get('ai_score', 0)
-                score_class = "high" if score >= 85 else "medium" if score >= 75 else "low"
-                score_color = "text-danger" if score >= 85 else "text-warning" if score >= 75 else "text-success"
+        # 从 PortfolioManager 获取持仓
+        try:
+            from src.portfolio.manager import PortfolioManager
+            portfolio_manager = PortfolioManager()
+            positions = portfolio_manager.get_positions()
 
-                with st.expander(f"<span class='code'>{record.get('symbol')}</span> {record.get('name')} | <span class='{score_color}'>{score}分</span>", expanded=False):
-                    col_m1, col_m2, col_m3 = st.columns(3)
-                    with col_m1:
-                        st.metric("现价", f"¥{record.get('price', 0):.2f}")
-                    with col_m2:
-                        st.metric("涨幅", f"{record.get('change_pct', 0):+.2f}%")
-                    with col_m3:
-                        st.metric("换手", f"{record.get('turnover', 0):.2f}%")
+            if positions:
+                for pos in positions:
+                    # 计算盈亏颜色
+                    profit_pct = pos.get('profit_loss_pct', 0)
+                    profit_color = "text-danger" if profit_pct > 0 else "text-success" if profit_pct < 0 else ""
 
-                    st.markdown(f"**建议**: {record.get('ai_suggestion', '')}")
-                    st.caption(f"{record.get('ai_reason', '')[:80]}...")
+                    with st.expander(
+                        f"<span class='code'>{pos.get('symbol')}</span> {pos.get('name')} | "
+                        f"{pos.get('shares')}股 | "
+                        f"<span class='{profit_color}'>{profit_pct:+.2f}%</span>",
+                        expanded=False
+                    ):
+                        col_p1, col_p2, col_p3 = st.columns(3)
+                        with col_p1:
+                            st.metric("成本价", f"¥{pos.get('avg_price', 0):.2f}")
+                        with col_p2:
+                            st.metric("现价", f"¥{pos.get('current_price', 0):.2f}")
+                        with col_p3:
+                            profit = pos.get('profit_loss', 0)
+                            st.metric("盈亏", f"¥{profit:+,.2f}")
 
-                    if st.button("移出", key=f"remove_{record['id']}", use_container_width=True):
-                        update_status(record['id'], 'Ignored')
-                        st.rerun()
-        else:
-            st.info("暂无自选股票，请从「AI投研日报」添加")
+                        st.caption(f"买入时间: {pos.get('buy_time', 'N/A')}")
+                        st.caption(f"市值: ¥{pos.get('market_value', 0):,.2f}")
+
+                # 显示账户摘要
+                st.markdown("---")
+                summary = portfolio_manager.get_summary()
+                st.markdown("**账户摘要**")
+                col_a1, col_a2, col_a3 = st.columns(3)
+                with col_a1:
+                    st.metric("总资产", f"¥{summary['total_assets']:,.0f}")
+                with col_a2:
+                    st.metric("持仓市值", f"¥{summary['total_market_value']:,.0f}")
+                with col_a3:
+                    st.metric("可用资金", f"¥{summary['cash']:,.0f}")
+
+            else:
+                st.info("""
+                **暂无持仓**
+
+                持仓来源：
+                1. 运行「AI投研日报」的"运行AI分析"
+                2. 当某只股票连续2次上榜时自动买入
+
+                当前触发阈值：2连榜
+                单次买入金额：5万元
+                """)
+        except Exception as e:
+            st.error(f"加载持仓失败: {e}")
 
     with col2:
         st.markdown("**本周统计**")
-        stats = get_statistics(days=7)
+        stats = get_statistics_cached(days=7)
 
         col_s1, col_s2 = st.columns(2)
         with col_s1:
@@ -675,7 +1048,7 @@ def render_tab_portfolio():
 
         st.markdown("---")
         st.markdown("**最近记录**")
-        recent = get_records(limit=10)
+        recent = get_records_by_status_cached(limit=10)
         if recent:
             for r in recent[:5]:
                 st.caption(f"{r.get('name')} | {r.get('ai_suggestion', '')} | {r.get('created_at', '')}")

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-AShare-Sentinel - AI 分析模块
+AShare-Sentinel - AI 分析模块 (量价时空四维评分体系)
 使用阿里云通义千问 (Qwen) 进行股票深度分析
 通过 OpenAI 兼容接口调用
+
+升级版：采用"量价时空"四维评分体系，专为 A 股短线 (T+1) 博弈环境设计
 """
 
 import json
@@ -29,7 +31,7 @@ load_dotenv()
 
 
 class AIStockAnalyzer:
-    """AI 股票分析器 (基于通义千问 OpenAI 兼容接口)"""
+    """AI 股票分析器 (量价时空四维评分体系)"""
 
     def __init__(self, api_key: str = None, base_url: str = None, model_name: str = "qwen-plus"):
         """
@@ -61,13 +63,126 @@ class AIStockAnalyzer:
 
         self.model_name = model_name
 
+    def generate_analysis_prompt(self, stock_data: Dict[str, Any], indicators: Dict[str, Any]) -> tuple:
+        """
+        生成 AI 分析的 Prompt（System + User）
+
+        Args:
+            stock_data: 股票基础数据
+            indicators: 技术指标数据
+
+        Returns:
+            tuple: (system_message, user_message)
+        """
+        symbol = stock_data.get("symbol", "")
+        name = stock_data.get("name", "")
+        price = stock_data.get("price", 0)
+        change_pct = stock_data.get("change_pct", 0)
+        turnover = stock_data.get("turnover", 0)
+        volume_ratio = stock_data.get("volume_ratio", 1.0)
+        sector = stock_data.get("sector", "未知")
+        strategy_name = stock_data.get("strategy", "通用策略")
+
+        # 从技术指标中提取数据
+        ma5 = indicators.get('ma5')
+        ma10 = indicators.get('ma10')
+        ma20 = indicators.get('ma20')
+        ma60 = indicators.get('ma60')
+        calc_volume_ratio = indicators.get('volume_ratio')
+        trend_status = indicators.get('trend_status', '未知')
+        volume_status = indicators.get('volume_status', '未知')
+
+        # 生成位置描述
+        from src.data.data_loader import generate_position_desc
+        position_desc = generate_position_desc(price, indicators)
+
+        # ========== System Prompt (角色设定) ==========
+        system_message = """你是一位拥有 15 年经验的 A 股游资操盘手，擅长通过量价关系捕捉短线爆发机会。
+
+你必须严格遵守以下"量价时空"四维评分体系：
+
+【评分规则】总分 100 分
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣ 量能 (Volume, 40 分) - 核心权重
+   ✓ 放量突破：量比 1.5-3.0，得分 35-40 分
+   ✓ 温和放量：量比 1.2-1.5，得分 25-34 分
+   ✗ 缩量上涨：量比 < 1.0，上限锁死 70 分！
+   ✗ 天量：量比 > 3.0，主力出货嫌疑，扣 10 分
+
+2️⃣ 趋势 (Trend, 30 分)
+   ✓ 多头排列：价格在 MA5/MA10/MA20 之上，得分 25-30 分
+   ✓ 中期上涨：站在 MA5 和 MA20 之上，得分 20-24 分
+   ✓ 短期强势：仅站上 MA5，得分 15-19 分
+   ✗ 长期下降：在 MA60 下方，扣 10 分
+
+3️⃣ 形态 (Pattern, 20 分)
+   加分项（各 +5 分）：
+   • 反包：吞没昨日阴线，主力吸筹
+   • 突破平台：突破前高压力位
+   • N 字反转：二波启动确认
+
+   扣分项（各 -5 分）：
+   • 长上影线：上方抛压重
+   • 长下影线：支撑不稳
+   • 高开低走：诱多陷阱
+
+4️⃣ 情绪 (Sentiment, 10 分)
+   ✓ 主流热点：当日领涨板块，得 8-10 分
+   ✓ 跟风上涨：非主流板块，得 3-7 分
+   ✗ 孤股上涨：无板块配合，得 0-2 分
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【输出要求】
+1. 评分必须精确到整数
+2. 分析理由要犀利，直接指出"核心亮点"或"逻辑硬伤"
+3. 严禁模棱两可的废话（如"谨慎关注""建议观望"）
+4. 如果有明显风险，必须明确指出
+
+【返回格式】纯 JSON（不要包含任何 markdown 标记）
+{
+    "score": 0-100 的整数评分,
+    "reason": "30 字以内的犀利分析",
+    "suggestion": "强力买入 / 买入 / 观望 / 放弃"
+}"""
+
+        # ========== User Prompt (具体分析任务) ==========
+        user_message = f"""【标的】{name} ({symbol})
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【核心数据】现价: ¥{price:.2f} (涨幅 {change_pct:+.2f}%)
+换手: {turnover:.2f}%  |  量比: {volume_ratio:.2f}
+板块: {sector}  |  策略: {strategy_name}
+
+【均线系统】MA5: {ma5 if ma5 else 'N/A'}  |  MA20: {ma20 if ma20 else 'N/A'}  |  MA60: {ma60 if ma60 else 'N/A'}
+趋势状态: {trend_status}
+量能状态: {volume_status} (5日均量比: {calc_volume_ratio if calc_volume_ratio else 'N/A'})
+
+【位置描述】{position_desc}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【请按四维体系打分并给出操作建议】
+
+特别注意：
+- 如果是缩量上涨，评分不得超过 75 分
+- 如果上方有 MA60 压制，评分不得超过 85 分
+- 放量突破平台且站上所有均线，可给 90+ 分
+
+请以纯 JSON 格式返回分析结果（不要包含 ```json 标记）：
+{{
+    "score": <0-100整数>,
+    "reason": "<30字犀利分析，直指核心亮点或硬伤>",
+    "suggestion": "<强力买入/买入/观望/放弃>"
+}}"""
+
+        return system_message, user_message
+
     def analyze_stock(
         self,
         stock_data: Dict[str, Any],
         strategy_name: str = "通用策略"
     ) -> Dict[str, Any]:
         """
-        分析单只股票
+        分析单只股票（使用量价时空四维评分体系）
 
         Args:
             stock_data: 股票数据字典，包含 {symbol, name, price, change_pct, turnover, volume_ratio, sector}
@@ -76,8 +191,8 @@ class AIStockAnalyzer:
         Returns:
             Dict: {
                 "score": int,        # 0-100 打分
-                "reason": str,       # 分析理由 (50字以内)
-                "suggestion": str    # "买入" / "观察" / "放弃"
+                "reason": str,       # 分析理由 (30字以内)
+                "suggestion": str    # "强力买入" / "买入" / "观望" / "放弃"
             }
         """
         symbol = stock_data.get("symbol", "")
@@ -88,35 +203,15 @@ class AIStockAnalyzer:
         volume_ratio = stock_data.get("volume_ratio", 1.0)
         sector = stock_data.get("sector", "未知")
 
-        # System prompt
-        system_message = "你是一位犀利的A股游资操盘手。请根据量价数据分析主力意图。"
+        # 计算技术指标
+        from src.data.data_loader import calculate_technical_indicators
+        indicators = calculate_technical_indicators(symbol, price, volume_ratio * 10000)  # 转换为手
 
-        # User prompt
-        user_message = f"""请分析这只股票的量价关系和主力意图。
+        # 添加策略名称到 stock_data
+        stock_data['strategy'] = strategy_name
 
-股票信息:
-- 代码: {symbol}
-- 名称: {name}
-- 现价: ¥{price:.2f}
-- 涨幅: {change_pct:+.2f}%
-- 换手率: {turnover:.2f}%
-- 量比: {volume_ratio:.2f}
-- 板块: {sector}
-- 策略: {strategy_name}
-
-请以纯 JSON 格式返回分析结果（不要包含 markdown 代码块标记），必须包含以下字段:
-{{
-    "score": <0-100的打分>,
-    "reason": "<50字以内的分析理由>",
-    "suggestion": "<买入/观察/放弃>"
-}}
-
-评分标准:
-- 90-100: 强力买入，主力意图明显
-- 70-89: 可以关注，有启动迹象
-- 50-69: 观望，信号不明
-- 0-49: 放弃，风险大于机会
-"""
+        # 生成 Prompt
+        system_message, user_message = self.generate_analysis_prompt(stock_data, indicators)
 
         try:
             response = self.client.chat.completions.create(
@@ -146,8 +241,20 @@ class AIStockAnalyzer:
 
             # 验证取值范围
             result["score"] = max(0, min(100, int(result["score"])))
-            if result["suggestion"] not in ["买入", "观察", "放弃"]:
-                result["suggestion"] = "观察"
+
+            # 规范化建议
+            valid_suggestions = ["强力买入", "买入", "观望", "放弃"]
+            if result["suggestion"] not in valid_suggestions:
+                if result["suggestion"] in ["买入", "观察"]:
+                    result["suggestion"] = "买入" if result["suggestion"] == "买入" else "观望"
+                else:
+                    result["suggestion"] = "观望"
+
+            # 根据评分自动调整建议
+            if result["score"] >= 90 and result["suggestion"] == "买入":
+                result["suggestion"] = "强力买入"
+            elif result["score"] < 60 and result["suggestion"] in ["强力买入", "买入"]:
+                result["suggestion"] = "观望"
 
             return result
 
@@ -165,7 +272,7 @@ class AIStockAnalyzer:
         return {
             "score": 0,
             "reason": "AI分析暂时不可用，请稍后重试",
-            "suggestion": "观察"
+            "suggestion": "观望"
         }
 
     def analyze_batch(
@@ -219,11 +326,11 @@ def analyze_stock(
 if __name__ == "__main__":
     # 测试代码
     print("=" * 60)
-    print("AI 股票分析器测试 (通义千问 OpenAI 接口)")
+    print("AI 股票分析器测试 (量价时空四维评分体系)")
     print("=" * 60)
 
     try:
-        # 测试数据: 东方财富
+        # 测试数据
         test_stock = {
             "symbol": "300059",
             "name": "东方财富",
@@ -236,7 +343,6 @@ if __name__ == "__main__":
 
         print(f"\n正在分析: {test_stock['name']} ({test_stock['symbol']})")
         print(f"现价: ¥{test_stock['price']:.2f} | 涨幅: +{test_stock['change_pct']:.2f}%")
-        print(f"策略: 冲击涨停")
 
         result = analyze_stock(test_stock, strategy_name="冲击涨停")
 

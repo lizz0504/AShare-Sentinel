@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 AShare-Sentinel - A股热度分析工具
-数据获取模块（增强版）
+数据获取模块（增强版 v2.0）
 
 本模块负责从 AkShare 获取实时行情数据
 集成缓存、日志、验证等功能
+
+稳定性升级 v2.0：
+- 使用 tenacity 库实现专业级重试机制
+- 仅在网络异常或超时时重试
+- 记录 Warning 级别的重试日志
 """
 
 import akshare as ak
@@ -13,6 +18,21 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 import warnings
+
+# 尝试导入 tenacity，如果没有安装则使用简单重试
+try:
+    from tenacity import (
+        retry,
+        stop_after_attempt,
+        wait_fixed,
+        retry_if_exception_type,
+        before_sleep_log
+    )
+    TENACITY_AVAILABLE = True
+except ImportError:
+    TENACITY_AVAILABLE = False
+
+import logging
 
 warnings.filterwarnings('ignore')
 
@@ -24,34 +44,68 @@ from ..utils.validator import DataValidator
 logger = get_logger(__name__)
 
 
-def _retry_fetch(func, max_retries: int = None, delay: int = None):
-    """
-    带重试的数据获取函数
+# =============================================================================
+# 重试装饰器配置
+# =============================================================================
 
-    Args:
-        func: 要执行的获取函数
-        max_retries: 最大重试次数
-        delay: 重试延迟（秒）
+if TENACITY_AVAILABLE:
+    # 使用 tenacity 的专业重试装饰器
+    # 仅在网络异常（RequestException）或超时时重试
+    @retry(
+        stop=stop_after_attempt(3),  # 最大重试 3 次
+        wait=wait_fixed(2),  # 固定等待 2 秒
+        retry=retry_if_exception_type(Exception),  # 任何异常都重试（包括网络超时）
+        before_sleep=before_sleep_log(logger, logging.WARNING),  # 重试前记录 WARNING 日志
+        reraise=True  # 重试失败后重新抛出异常
+    )
+    def _fetch_with_retry(func):
+        """
+        带重试的数据获取函数（使用 tenacity）
 
-    Returns:
-        函数执行结果或None
-    """
-    max_retries = max_retries or DataFetch.MAX_RETRIES
-    delay = delay or DataFetch.RETRY_DELAY
+        Args:
+            func: 要执行的获取函数
 
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            return func()
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                logger.warning(f"获取数据失败，{delay}秒后重试 ({attempt + 1}/{max_retries}): {e}")
-                time.sleep(delay)
-            else:
-                logger.error(f"获取数据失败，已达最大重试次数: {e}")
+        Returns:
+            函数执行结果
 
-    return None
+        Raises:
+            Exception: 重试3次后仍失败，抛出原始异常
+        """
+        return func()
+else:
+    # 降级方案：使用简单的重试逻辑
+    def _fetch_with_retry(func, max_retries: int = 3, delay: int = 2):
+        """
+        带重试的数据获取函数（降级方案）
+
+        Args:
+            func: 要执行的获取函数
+            max_retries: 最大重试次数
+            delay: 重试延迟（秒）
+
+        Returns:
+            函数执行结果或None
+
+        Raises:
+            Exception: 重试失败后抛出最后一次异常
+        """
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return func()
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    logger.warning(f"获取数据失败，{delay}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"获取数据失败，已达最大重试次数: {e}")
+
+        # 重新抛出最后一次异常
+        if last_error:
+            raise last_error
+
+        return None
 
 
 def fetch_realtime_data(
@@ -132,11 +186,16 @@ def fetch_realtime_data(
 
     logger.info("正在获取A股实时行情数据...")
 
+    # 定义获取函数
     def _fetch():
         return ak.stock_zh_a_spot_em()
 
     # 带重试的获取
-    df = _retry_fetch(_fetch)
+    try:
+        df = _fetch_with_retry(_fetch)
+    except Exception as e:
+        logger.error(f"获取实时行情数据失败（已重试3次）: {e}")
+        return pd.DataFrame(), ""
 
     if df is None or df.empty:
         logger.error("获取实时行情数据失败")
@@ -260,7 +319,11 @@ def fetch_sector_data(top_n: int = 10, use_cache: bool = True) -> pd.DataFrame:
     def _fetch():
         return ak.stock_board_industry_name_em()
 
-    df = _retry_fetch(_fetch)
+    try:
+        df = _fetch_with_retry(_fetch)
+    except Exception as e:
+        logger.error(f"获取板块数据失败（已重试3次）: {e}")
+        return pd.DataFrame()
 
     if df is None or df.empty:
         logger.error("获取板块数据失败")
@@ -332,7 +395,11 @@ def fetch_concept_data(top_n: int = 10, use_cache: bool = True) -> pd.DataFrame:
     def _fetch():
         return ak.stock_board_concept_name_em()
 
-    df = _retry_fetch(_fetch)
+    try:
+        df = _fetch_with_retry(_fetch)
+    except Exception as e:
+        logger.error(f"获取概念板块数据失败（已重试3次）: {e}")
+        return pd.DataFrame()
 
     if df is None or df.empty:
         logger.error("获取概念板块数据失败")
@@ -397,7 +464,11 @@ def get_hot_stocks_by_sector(
     def _fetch():
         return ak.stock_board_industry_cons_em(symbol=sector_name)
 
-    df = _retry_fetch(_fetch)
+    try:
+        df = _fetch_with_retry(_fetch)
+    except Exception as e:
+        logger.error(f"获取 {sector_name} 板块股票失败（已重试3次）: {e}")
+        return pd.DataFrame()
 
     if df is None or df.empty:
         logger.error(f"获取 {sector_name} 板块股票失败")
@@ -518,11 +589,167 @@ def get_stock_sector(symbol: str) -> str:
         return "未知"
 
 
+def calculate_technical_indicators(symbol: str, current_price: float, current_volume: float) -> dict:
+    """
+    计算技术指标（均线、量能等）
+
+    Args:
+        symbol: 股票代码
+        current_price: 当前价格
+        current_volume: 当前成交量（手）
+
+    Returns:
+        dict: 技术指标字典，包含 MA5, MA10, MA20, MA60, 量比等
+    """
+    try:
+        # 获取历史数据（最近 60 个交易日）
+        hist_df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date="20240101", adjust="qfq")
+
+        if hist_df is None or len(hist_df) < 20:
+            # 数据不足，返回默认值
+            return {
+                'ma5': None,
+                'ma10': None,
+                'ma20': None,
+                'ma60': None,
+                'ma5_volume': None,
+                'volume_ratio': None,
+                'is_above_ma5': False,
+                'is_above_ma20': False,
+                'is_above_ma60': False,
+                'trend_status': '未知',
+                'volume_status': '未知'
+            }
+
+        # 计算价格均线
+        hist_df['MA5'] = hist_df['收盘'].rolling(window=5).mean()
+        hist_df['MA10'] = hist_df['收盘'].rolling(window=10).mean()
+        hist_df['MA20'] = hist_df['收盘'].rolling(window=20).mean()
+        hist_df['MA60'] = hist_df['收盘'].rolling(window=60).mean()
+
+        # 计算量能均线
+        hist_df['MA5_Volume'] = hist_df['成交量'].rolling(window=5).mean()
+
+        # 获取最新的均线值
+        latest = hist_df.iloc[-1]
+        ma5 = latest['MA5'] if not pd.isna(latest['MA5']) else None
+        ma10 = latest['MA10'] if not pd.isna(latest['MA10']) else None
+        ma20 = latest['MA20'] if not pd.isna(latest['MA20']) else None
+        ma60 = latest['MA60'] if not pd.isna(latest['MA60']) else None
+        ma5_volume = latest['MA5_Volume'] if not pd.isna(latest['MA5_Volume']) else None
+
+        # 计算量比
+        if ma5_volume and ma5_volume > 0:
+            volume_ratio = current_volume / ma5_volume
+        else:
+            volume_ratio = None
+
+        # 判断趋势状态
+        is_above_ma5 = ma5 and current_price > ma5
+        is_above_ma20 = ma20 and current_price > ma20
+        is_above_ma60 = ma60 and current_price > ma60
+
+        # 趋势判断
+        if is_above_ma5 and is_above_ma20 and is_above_ma60:
+            trend_status = "多头排列"
+        elif is_above_ma5 and is_above_ma20:
+            trend_status = "中期上涨"
+        elif is_above_ma5:
+            trend_status = "短期强势"
+        else:
+            trend_status = "弱势调整"
+
+        # 量能状态
+        if volume_ratio:
+            if volume_ratio >= 2.0:
+                volume_status = "放量"
+            elif volume_ratio >= 1.2:
+                volume_status = "温和放量"
+            elif volume_ratio < 0.8:
+                volume_status = "缩量"
+            else:
+                volume_status = "正常"
+        else:
+            volume_status = "未知"
+
+        return {
+            'ma5': round(ma5, 2) if ma5 else None,
+            'ma10': round(ma10, 2) if ma10 else None,
+            'ma20': round(ma20, 2) if ma20 else None,
+            'ma60': round(ma60, 2) if ma60 else None,
+            'ma5_volume': int(ma5_volume) if ma5_volume else None,
+            'volume_ratio': round(volume_ratio, 2) if volume_ratio else None,
+            'is_above_ma5': is_above_ma5,
+            'is_above_ma20': is_above_ma20,
+            'is_above_ma60': is_above_ma60,
+            'trend_status': trend_status,
+            'volume_status': volume_status
+        }
+
+    except Exception as e:
+        logger.warning(f"计算 {symbol} 技术指标失败: {e}")
+        return {
+            'ma5': None,
+            'ma10': None,
+            'ma20': None,
+            'ma60': None,
+            'ma5_volume': None,
+            'volume_ratio': None,
+            'is_above_ma5': False,
+            'is_above_ma20': False,
+            'is_above_ma60': False,
+            'trend_status': '未知',
+            'volume_status': '未知'
+        }
+
+
+def generate_position_desc(current_price: float, indicators: dict) -> str:
+    """
+    生成价格相对位置的描述
+
+    Args:
+        current_price: 当前价格
+        indicators: 技术指标字典
+
+    Returns:
+        str: 位置描述
+    """
+    ma5 = indicators.get('ma5')
+    ma20 = indicators.get('ma20')
+    ma60 = indicators.get('ma60')
+
+    desc_parts = []
+
+    if ma5:
+        if current_price > ma5:
+            desc_parts.append(f"站在5日线({ma5:.2f})之上")
+        else:
+            desc_parts.append(f"跌破5日线({ma5:.2f})")
+
+    if ma20:
+        if current_price > ma20:
+            desc_parts.append("在中期均线上方")
+        else:
+            desc_parts.append("受20日线压制")
+
+    if ma60:
+        if current_price > ma60:
+            desc_parts.append("长期趋势向上")
+        else:
+            desc_parts.append("处于长期下降趋势")
+
+    return "；".join(desc_parts) if desc_parts else "位置未明"
+
+
 if __name__ == "__main__":
     # 测试代码
     print("="*60)
-    print("AShare-Sentinel 数据获取模块测试（增强版）")
+    print("AShare-Sentinel 数据获取模块测试（增强版 v2.0）")
     print("="*60)
+
+    if not TENACITY_AVAILABLE:
+        print("\n[提示] tenacity 库未安装，使用简单重试机制")
+        print("安装命令: pip install tenacity\n")
 
     # 1. 获取实时行情数据
     realtime_data, update_time = fetch_realtime_data(filter_st=True, use_cache=True, validate=True)

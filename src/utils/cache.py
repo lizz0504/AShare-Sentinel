@@ -179,8 +179,14 @@ class DataFrameCache:
     def get(self, key: str) -> Optional[pd.DataFrame]:
         """获取缓存的DataFrame"""
         data = self.cache_manager.get(key)
+        if data is None:
+            return None
+        # 处理DataFrame
         if isinstance(data, pd.DataFrame):
             return data
+        # 处理旧格式的元组 (DataFrame, str)
+        if isinstance(data, tuple) and len(data) >= 1:
+            return data[0]
         return None
 
     def set(self, key: str, df: pd.DataFrame) -> None:
